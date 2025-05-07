@@ -30,7 +30,6 @@ Changelog
 1.03
 
 *   fixed error from  google form residue not being integer.
-*   changed 19->20 nt for sgRNA target
 """
 
 # @title Yeast AutoOligo CRISPR Helper Form Entry {"run":"auto","vertical-output":true,"form-width":"256px","display-mode":"form"}

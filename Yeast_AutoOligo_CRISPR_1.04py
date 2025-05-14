@@ -1,0 +1,320 @@
+#converted from googleColab code in gpt
+
+import requests
+import re
+from Bio.Seq import Seq  # Use Biopython to handle sequence manipulation
+from Bio import pairwise2
+from Bio.pairwise2 import format_alignment
+
+# Function to resolve the gene name to its Ensembl gene ID
+def resolve_gene_name(yeast_gene):
+    """Resolve the common or systematic yeast gene name to its Ensembl gene ID."""
+    url = f"https://rest.ensembl.org/xrefs/symbol/saccharomyces_cerevisiae/{yeast_gene}?content-type=application/json"
+    response = requests.get(url)
+    if response.status_code == 200 and len(response.json()) > 0:
+        return response.json()[0]['id']  # Return the Ensembl ID (e.g., YBR127C)
+    else:
+        raise ValueError("Gene not found. Please check the gene name.")
+
+# Function to fetch the gene sequence from Ensembl
+def get_gene_sequence(yeast_gene):
+    """Fetch the yeast gene sequence using Ensembl API for the resolved gene ID."""
+    url = f"https://rest.ensembl.org/sequence/id/{yeast_gene}?content-type=text/plain"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return response.text.strip()  # Remove any leading/trailing whitespace
+    else:
+        raise ValueError("Gene sequence not found in database.")
+
+# Function to find Cas9 target sites near the amino acid position
+def find_cas9_sites(gene_sequence, amino_acid_position, window=105):
+    """Identify Cas9 guide RNA target sites near the amino acid position, on both forward and reverse strands."""
+    nucleotide_position = (amino_acid_position - 1) * 3  # Convert to 0-based index and nucleotide position
+    start = max(0, nucleotide_position - window // 2)
+    end = min(len(gene_sequence), nucleotide_position + window // 2)
+    region = gene_sequence[start:end]
+
+    # Forward strand: look for NGG PAM
+    forward_cas9_sites = []
+    for m in re.finditer(r'(?=([ACGT]{21}GG))', region):
+        pos = start + m.start()
+        guide_pam_seq = m.group(1)  # 20 nt guide + 'GG' PAM
+        forward_cas9_sites.append((pos, guide_pam_seq, 'forward'))
+
+    # Reverse strand: look for CCN PAM (corresponds to NGG on reverse complement)
+    reverse_cas9_sites = []
+    for m in re.finditer(r'(?=(CC[ACGT]{21}))', region):
+        pos = start + m.start()
+        guide_pam_seq = m.group(1)  # 'CC' PAM + 20 nt guide
+        reverse_cas9_sites.append((pos, guide_pam_seq, 'reverse'))
+
+    all_cas9_sites = forward_cas9_sites + reverse_cas9_sites
+    cas9_sites_sorted = sorted(all_cas9_sites, key=lambda site: abs(site[0] - nucleotide_position))
+    return cas9_sites_sorted
+
+# Function to convert codon to its amino acid
+def codon_to_amino_acid(codon):
+    """Return the amino acid corresponding to the codon."""
+    codon = codon.upper()
+    for amino_acid, codons in codon_table.items():
+        if codon in codons:
+            return amino_acid
+    return None
+
+# Function to generate the repair template
+def generate_repair_template(gene_sequence, cas9_site, amino_acid_position, new_amino_acid):
+    """Create a repair template with the mutation centered as much as possible, ensuring a silent mutation in the PAM."""
+    mutation_position = (amino_acid_position - 1) * 3
+    min_flanking_length = 30
+    cas9_cut_position = cas9_site[0] + 17
+    pam_start = cas9_site[0]
+    homology_start = max(0, min(cas9_cut_position, mutation_position) - min_flanking_length)
+    homology_end = min(len(gene_sequence), max(cas9_cut_position, mutation_position) + min_flanking_length)
+    homology_region = gene_sequence[homology_start:homology_end]
+
+    homology_list = list(homology_region)
+    codon_start_in_homology = mutation_position - homology_start
+    original_codon = ''.join(homology_list[codon_start_in_homology:codon_start_in_homology+3]).upper()
+    new_codon_options = codon_table.get(new_amino_acid.upper(), [])
+    if not new_codon_options:
+        print(f"Error: Invalid amino acid '{new_amino_acid}'.")
+        return None, None, None, None
+
+    for codon_option in new_codon_options:
+        if codon_option != original_codon:
+            new_codon = codon_option.lower()
+            break
+    else:
+        new_codon = new_codon_options[0].lower()
+
+    for i in range(3):
+        homology_list[codon_start_in_homology + i] = new_codon[i]
+
+    homology_list, silent_mutation_applied = mutate_pam(homology_list, cas9_site[1], cas9_site[2], pam_start, homology_start, codon_table)
+    if not silent_mutation_applied:
+        return None, None, None, None
+
+    mutated_homology = ''.join(homology_list)
+    repair_seq = Seq(mutated_homology)
+    reverse_complement = repair_seq.reverse_complement()
+    original_homology_region = gene_sequence[homology_start:homology_end]
+
+    return mutated_homology, str(reverse_complement), original_homology_region, homology_start
+
+# Function to apply silent mutation to the PAM site
+def mutate_pam(homology_list, guide_pam_seq, strand, pam_start, homology_start, codon_table):
+    """Ensure that the mutation only targets the PAM site (GG for forward or CC for reverse strand) with silent mutations."""
+    pam_pos_in_homology = pam_start - homology_start
+    if strand == 'forward':
+        pam_indices = [pam_pos_in_homology + 21, pam_pos_in_homology + 22]
+    else:
+        pam_indices = [pam_pos_in_homology, pam_pos_in_homology + 1]
+
+    mutated = False
+    codon_positions = set()
+    for idx in pam_indices:
+        codon_start = (idx // 3) * 3
+        codon_positions.add(codon_start)
+
+    for codon_start in codon_positions:
+        codon = ''.join(homology_list[codon_start:codon_start+3])
+        amino_acid = codon_to_amino_acid(codon.upper())
+        if amino_acid is None or amino_acid == 'STOP':
+            continue
+
+        synonymous_codons = codon_table[amino_acid]
+        for syn_codon in synonymous_codons:
+            syn_codon = syn_codon.upper()
+            differences = [i for i in range(3) if syn_codon[i] != codon[i].upper()]
+
+            pam_positions_in_codon = [idx - codon_start for idx in pam_indices if codon_start <= idx < codon_start + 3]
+
+            if any(pos in differences for pos in pam_positions_in_codon):
+                for i in range(3):
+                    homology_list[codon_start + i] = syn_codon[i].lower() if syn_codon[i] != codon[i].upper() else syn_codon[i]
+                mutated = True
+                break
+
+    return homology_list, mutated
+
+# Main function
+def main():
+    # User inputs
+    gene_name = input("Enter the yeast gene name (e.g., PHO13): ")
+    amino_acid_number = int(input("Enter the amino acid residue number (e.g., 123): "))
+    desired_aa = input("Enter the desired amino acid change (one-letter code, e.g., S): ")
+
+    global codon_table
+    codon_table = {
+        'F': ['TTT', 'TTC'],
+        'L': ['TTA', 'TTG', 'CTT', 'CTC', 'CTA', 'CTG'],
+        'I': ['ATT', 'ATC', 'ATA'],
+        'M': ['ATG'],
+        'V': ['GTT', 'GTC', 'GTA', 'GTG'],
+        'S': ['TCT', 'TCC', 'TCA', 'TCG', 'AGT', 'AGC'],
+        'P': ['CCT', 'CCC', 'CCA', 'CCG'],
+        'T': ['ACT', 'ACC', 'ACA', 'ACG'],
+        'A': ['GCT', 'GCC', 'GCA', 'GCG'],
+        'Y': ['TAT', 'TAC'],
+        'H': ['CAT', 'CAC'],
+        'Q': ['CAA', 'CAG'],
+        'N': ['AAT', 'AAC'],
+        'K': ['AAA', 'AAG'],
+        'D': ['GAT', 'GAC'],
+        'E': ['GAA', 'GAG'],
+        'C': ['TGT', 'TGC'],
+        'R': ['CGT', 'CGC', 'CGA', 'CGG', 'AGA', 'AGG'],
+        'G': ['GGT', 'GGC', 'GGA', 'GGG'],
+        'W': ['TGG'],
+        '*': ['TAA', 'TAG', 'TGA'],
+    }
+
+    # Step 1: Resolve gene name
+    try:
+        resolved_gene_name = resolve_gene_name(gene_name)
+        print("Gene:", gene_name, "resolved as:", resolved_gene_name)
+    except ValueError as e:
+        print(e)
+        return
+
+    # Step 2: Fetch the gene sequence
+    gene_seq = get_gene_sequence(resolved_gene_name)
+
+    # Step 3: Find Cas9 target sites near the amino_acid_position
+    cas9_sites = find_cas9_sites(gene_seq, amino_acid_number, window=105)
+
+    if not cas9_sites:
+        print("No nearby Cas9 target sites found.")
+        return
+
+    # Step 4: Generate repair templates for each selected Cas9 site
+    repair_templates = []
+    for idx, site in enumerate(cas9_sites):
+        try:
+            repair_template, reverse_complement, original_region, homology_start = generate_repair_template(gene_seq, site, amino_acid_number, desired_aa)
+            if repair_template is None:
+                continue
+            repair_templates.append((site, repair_template, reverse_complement, original_region, homology_start))
+        except ValueError as e:
+            print(f"Error for sgRNA {idx + 1}: {e}")
+            continue
+
+    if not repair_templates:
+        print("No sgRNAs available with silent PAM mutations.")
+        return
+
+    # Step 5: Display all found guide RNAs and corresponding repair templates
+    for idx, (site, template, rev_comp, original_region, homology_start) in enumerate(repair_templates):
+        if site[2] == 'reverse':
+            sgRNA_seq = str(Seq(site[1]).reverse_complement())
+        else:
+            sgRNA_seq = site[1]
+
+        if not (sgRNA_seq.endswith('GG') or sgRNA_seq.startswith('CC')):
+            print(f"Warning: sgRNA {idx + 1} does not end with NGG or start with CCN.")
+
+        modified_sgRNA_seq = sgRNA_seq[:-3] if sgRNA_seq.endswith('GG') else sgRNA_seq[3:]
+        modified_sgRNA = 'gatc' + modified_sgRNA_seq + 'GTTTTAGAGCTAG'.lower()
+        modified_sgRNA_rev_comp = 'ctagctctaaaac' + str(Seq(modified_sgRNA_seq).reverse_complement())
+
+        strand_direction = "forward" if site[2] == 'forward' else "reverse"
+        print(f"\nsgRNA {idx + 1}: {sgRNA_seq} (Strand: {strand_direction}, Position in gene: {site[0]})")
+        print(f"pML104 cloning Oligo{idx + 1}A: {modified_sgRNA}")
+        print(f"pML104 cloning Oligo{idx + 1}B: {modified_sgRNA_rev_comp}")
+        print(f"RepairTemplate Oligo{idx + 1}A: {template}")
+        print(f"RepairTemplate Oligo{idx + 1}B: {rev_comp}")
+
+        # Sequence alignment
+        match_score = 2
+        mismatch_score = -1
+        gap_open_penalty = -1000
+        gap_extend_penalty = -1000
+
+        alignments = pairwise2.align.globalms(original_region.upper(), template.upper(), match_score, mismatch_score, gap_open_penalty, gap_extend_penalty)
+        alignment = alignments[0]
+        print(format_alignment(*alignment))
+
+        # Protein translation
+        original_protein = Seq(original_region).translate()
+        repaired_protein = Seq(template).translate()
+
+        print("\nPartial Amino Acid Alignment:")
+        frame_0_protein = Seq(template).translate(to_stop=True)
+        frame_1_protein = Seq(template[1:]).translate(to_stop=True)
+        frame_2_protein = Seq(template[2:]).translate(to_stop=True)
+
+        full_length_original_protein = Seq(gene_seq).translate(to_stop=True)
+
+        alignments_0 = pairwise2.align.localms(
+            str(full_length_original_protein),
+            str(frame_0_protein),
+            match_score,
+            mismatch_score,
+            -5,
+            -4
+        )
+        alignments_1 = pairwise2.align.localms(
+            str(full_length_original_protein),
+            str(frame_1_protein),
+            match_score,
+            mismatch_score,
+            -5,
+            -4
+        )
+        alignments_2 = pairwise2.align.localms(
+            str(full_length_original_protein),
+            str(frame_2_protein),
+            match_score,
+            mismatch_score,
+            -5,
+            -4
+        )
+
+        all_alignments = [
+            (alignments_0, 0),
+            (alignments_1, 1),
+            (alignments_2, 2)
+        ]
+
+        best_alignment = None
+        best_score = float('-inf')
+        best_frame = None
+        for aln_list, frame in all_alignments:
+            if aln_list:
+                aln = aln_list[0]
+                if aln.score > best_score:
+                    best_score = aln.score
+                    best_alignment = aln
+                    best_frame = frame
+
+        if best_alignment:
+            aligned_seq1, aligned_seq2, score, begin, end = best_alignment
+            start = 0
+            end_c = len(aligned_seq1)
+
+            while start < end_c and aligned_seq1[start] == '-' and aligned_seq2[start] == '-':
+                start += 1
+
+            while end_c > start and aligned_seq1[end_c-1] == '-' and aligned_seq2[end_c-1] == '-':
+                end_c -= 1
+
+            cropped_seq1 = aligned_seq1[start:end_c]
+            cropped_seq2 = aligned_seq2[start:end_c]
+
+            cropped_begin = begin + start
+            cropped_end = begin + end_c
+
+            cropped_alignment = format_alignment(
+                cropped_seq1,
+                cropped_seq2,
+                score,
+                cropped_begin,
+                cropped_end
+            )
+
+            print(cropped_alignment)
+        else:
+            print("No valid amino acid alignments found.")
+
+if __name__ == "__main__":
+    main()

@@ -5,3 +5,5 @@ Input a yeast gene name, the amino acid number, and amino acid substituion desir
 For plasmid information, see Laughery et al. Yeast. 2015 https://doi.org/10.1002/yea.3098. Plasmid is available on Addgene https://www.addgene.org/67638/
 
 Full instructions are located within the Yeast CRISPR CURE documentation.
+
+Stopped updating this python version 1 and started working with web version CRISPR Helper 2.0 (and fork CODY)
